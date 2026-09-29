@@ -350,7 +350,7 @@ pub(crate) type LastWrite = Arc<std::sync::Mutex<Option<std::time::Instant>>>;
 /// Record that a flush succeeded. Called once per flush, never per frame, so
 /// this stays off the per-packet path.
 fn mark_written(last_write: &LastWrite) {
-    *last_write.lock().unwrap() = Some(std::time::Instant::now());
+    *lock_recover!(last_write) = Some(std::time::Instant::now());
 }
 
 /// Age of an optional timestamp, rendered for logs.
@@ -417,12 +417,14 @@ pub(crate) async fn peer_reader(
                 // Time left on the outstanding deadline. `None` means it just
                 // expired; no deadline at all means idle, so wait a full
                 // interval before looking again.
-                let remaining = {
-                    let deadline = *read_deadline.lock().unwrap();
-                    match deadline {
+                let remaining = match lock!(read_deadline) {
+                    Ok(deadline) => match *deadline {
                         Some(d) => d.checked_duration_since(std::time::Instant::now()),
                         None => Some(peer_timeout),
-                    }
+                    },
+                    // Cannot trust the deadline; treat it as unset and wait a full
+                    // interval rather than tear the link down on a bad reading.
+                    Err(_) => None,
                 };
 
                 let wait = match remaining {
@@ -440,7 +442,7 @@ pub(crate) async fn peer_reader(
                             break 'poll None;
                         }
                         probes_sent += 1;
-                        *read_deadline.lock().unwrap() =
+                        *lock_recover!(read_deadline) =
                             Some(std::time::Instant::now() + peer_timeout);
                         // Neither implementation answers a keepalive, so this
                         // does not draw a reply out of the peer — the reply
@@ -472,7 +474,7 @@ pub(crate) async fn peer_reader(
 
         // Any received frame clears the deadline (peer is alive) and forgives
         // whatever probes it took to get here.
-        *read_deadline.lock().unwrap() = None;
+        *lock_recover!(read_deadline) = None;
         probes_sent = 0;
         last_recv = Some(std::time::Instant::now());
 
@@ -677,7 +679,7 @@ pub(crate) async fn peer_reader(
             Error::OversizedMessage => "oversized-message",
             _ => "io",
         };
-        let last_write_at = *last_write.lock().unwrap();
+        let last_write_at = *lock_recover!(last_write);
         tracing::info!(
             "peer_reader[{}]: disconnect from {} reason={} error=\"{}\" budget={}x{}ms probes_sent={} last_rx={} last_rx_type={} last_tx={}",
             peer_id,
@@ -731,7 +733,7 @@ const MAX_DRAIN_PER_ITER: usize = 96;
 /// Matches Go's `if m.deadlined { return }` check — once armed, the deadline
 /// stays until the reader clears it on receiving any frame.
 fn arm_read_deadline(read_deadline: &ReadDeadline, peer_timeout: Duration) {
-    let mut dl = read_deadline.lock().unwrap();
+    let mut dl = lock_recover!(read_deadline);
     if dl.is_none() {
         *dl = Some(std::time::Instant::now() + peer_timeout);
     }

@@ -638,9 +638,12 @@ impl ConcurrentSessionManager {
     /// Handle incoming traffic (hot path).
     /// Uses 3-phase pattern: snapshot under lock → decrypt outside lock → finalize under lock.
     fn handle_traffic(&self, from: &PublicKey, data: &[u8], our_ed_priv: &ed25519_dalek::SigningKey) -> Vec<OutAction> {
-        let session_arc = {
-            let map = self.sessions.read().unwrap();
-            map.get(from).cloned()
+        let session_arc = match read_lock!(self.sessions) {
+            Ok(map) => map.get(from).cloned(),
+            // Cannot read the table, so treat the peer as unknown: the branch below
+            // starts a fresh handshake, which is self-healing rather than a dropped
+            // packet.
+            Err(_) => None,
         };
 
         let Some(session_arc) = session_arc else {
@@ -654,9 +657,15 @@ impl ConcurrentSessionManager {
             };
         };
 
-        // Phase 1: snapshot under lock
+        // Phase 1: snapshot under lock. On poison the keys behind the session may
+        // be half-rotated, so the packet is dropped rather than trusted. Poison is
+        // sticky, so that is not a one-off: the session stays unusable until it is
+        // renegotiated. The guard is scoped to this block: phases 2 and 3 re-take the
+        // same lock and it is not reentrant.
         let snap = {
-            let info = session_arc.lock().unwrap();
+            let Ok(info) = lock!(session_arc) else {
+                return Vec::new();
+            };
             match info.recv_snapshot(data) {
                 Ok(snap) => snap,
                 Err(RecvSnapshotError::SendInit { send_pub, next_pub, local_key_seq }) => {
@@ -674,7 +683,10 @@ impl ConcurrentSessionManager {
         let (payload, inner_key) = match decrypt_outside_lock(&snap, data) {
             Ok(result) => result,
             Err(RecvAction::SendInit) => {
-                let info = session_arc.lock().unwrap();
+                let Ok(info) = lock!(session_arc) else {
+                    // Cannot read the keys to build an Init; drop the packet.
+                    return Vec::new();
+                };
                 let init = SessionInit::new(&info.send_pub, &info.next_pub, info.local_key_seq);
                 return match init.encrypt(our_ed_priv, from, SESSION_TYPE_INIT, self.group_auth.preimage()) {
                     Ok(data) => vec![OutAction::SendToInner { dest: *from, data }],
@@ -684,9 +696,9 @@ impl ConcurrentSessionManager {
             Err(RecvAction::Drop) => return Vec::new(),
         };
 
-        // Phase 3: finalize under lock
-        {
-            let mut info = session_arc.lock().unwrap();
+        // Phase 3: finalize under lock. On poison the counters behind the session
+        // may be inconsistent, so this packet is simply not counted.
+        if let Ok(mut info) = lock!(session_arc) {
             info.recv_finalize(&snap, inner_key, payload.len() as u64);
         }
 
@@ -704,15 +716,18 @@ impl ConcurrentSessionManager {
         msg: &[u8],
         our_ed_priv: &ed25519_dalek::SigningKey,
     ) -> Vec<OutAction> {
-        let session_arc = {
-            let map = self.sessions.read().unwrap();
-            map.get(dest).cloned()
+        let session_arc = match read_lock!(self.sessions) {
+            Ok(map) => map.get(dest).cloned(),
+            Err(_) => None,
         };
 
         if let Some(session_arc) = session_arc {
-            // Phase 1: snapshot under lock
+            // Phase 1: snapshot under lock. Guard scoped to this block — phase 3
+            // re-takes the same lock and it is not reentrant.
             let snap = {
-                let mut info = session_arc.lock().unwrap();
+                let Ok(mut info) = lock!(session_arc) else {
+                    return Vec::new();
+                };
                 match info.send_snapshot() {
                     Ok(snap) => snap,
                     Err(_) => return Vec::new(),
@@ -725,9 +740,9 @@ impl ConcurrentSessionManager {
                 Err(_) => return Vec::new(),
             };
 
-            // Phase 3: finalize under lock
-            {
-                let mut info = session_arc.lock().unwrap();
+            // Phase 3: finalize under lock. On poison the send counters may be
+            // inconsistent, so this packet is simply not counted.
+            if let Ok(mut info) = lock!(session_arc) {
                 info.send_finalize(msg.len() as u64);
             }
 
@@ -750,14 +765,16 @@ impl ConcurrentSessionManager {
         let mut actions = Vec::new();
 
         // Try read-lock first: existing session?
-        let existing = {
-            let map = self.sessions.read().unwrap();
-            map.get(from).cloned()
+        let existing = match read_lock!(self.sessions) {
+            Ok(map) => map.get(from).cloned(),
+            Err(_) => None,
         };
 
         if let Some(session_arc) = existing {
             // Existing session: update under per-session lock
-            let mut info = session_arc.lock().unwrap();
+            let Ok(mut info) = lock!(session_arc) else {
+                return actions;
+            };
             if init.seq <= info.seq {
                 return actions; // stale
             }
@@ -770,12 +787,16 @@ impl ConcurrentSessionManager {
             }
         } else {
             // New session: need write lock on map
-            let mut map = self.sessions.write().unwrap();
+            let Ok(mut map) = write_lock!(self.sessions) else {
+                return actions;
+            };
 
             // Double-check: another thread may have inserted between read and write
             if let Some(session_arc) = map.get(from).cloned() {
                 drop(map);
-                let mut info = session_arc.lock().unwrap();
+                let Ok(mut info) = lock!(session_arc) else {
+                    return actions;
+                };
                 if init.seq <= info.seq {
                     return actions;
                 }
@@ -823,25 +844,31 @@ impl ConcurrentSessionManager {
         let mut actions = Vec::new();
 
         // Try read-lock first: existing session?
-        let existing = {
-            let map = self.sessions.read().unwrap();
-            map.get(from).cloned()
+        let existing = match read_lock!(self.sessions) {
+            Ok(map) => map.get(from).cloned(),
+            Err(_) => None,
         };
 
         if let Some(session_arc) = existing {
             // Existing session: pure ack — just update keys, no reply needed.
-            let mut info = session_arc.lock().unwrap();
+            let Ok(mut info) = lock!(session_arc) else {
+                return actions;
+            };
             if ack.seq > info.seq {
                 info.handle_update(ack);
             }
         } else {
             // New session from ack: need write lock
-            let mut map = self.sessions.write().unwrap();
+            let Ok(mut map) = write_lock!(self.sessions) else {
+                return actions;
+            };
 
             // Double-check
             if let Some(session_arc) = map.get(from).cloned() {
                 drop(map);
-                let mut info = session_arc.lock().unwrap();
+                let Ok(mut info) = lock!(session_arc) else {
+                    return actions;
+                };
                 if ack.seq > info.seq {
                     info.handle_update(ack);
                 }
@@ -892,7 +919,11 @@ impl ConcurrentSessionManager {
     ) -> (Option<Vec<u8>>, SessionInfo) {
         let mut info = SessionInfo::new(init.current, init.next, init.seq);
 
-        let mut buffers = self.buffers.lock().unwrap();
+        let Ok(mut buffers) = lock!(self.buffers) else {
+            // Cannot reach the buffer, so whatever was queued for this peer is lost.
+            // The session itself is still created from the init.
+            return (None, info);
+        };
         let buffered_data = if let Some(buf) = buffers.remove(ed) {
             info.send_pub = buf.init.current;
             info.send_priv = buf.current_priv;
@@ -916,7 +947,11 @@ impl ConcurrentSessionManager {
     ) -> Vec<OutAction> {
         let mut actions = Vec::new();
 
-        let mut buffers = self.buffers.lock().unwrap();
+        // On poison the buffer for this peer may be half-written, so the message is
+        // dropped rather than queued behind an init we could not record.
+        let Ok(mut buffers) = lock!(self.buffers) else {
+            return actions;
+        };
         let buf = buffers.entry(*dest).or_insert_with(|| {
             let (current_pub, current_priv) = new_box_keys();
             let (next_pub, next_priv) = new_box_keys();
@@ -942,26 +977,37 @@ impl ConcurrentSessionManager {
     }
 
     /// Clean up expired sessions and buffers.
+    ///
+    /// A poisoned lock skips that sweep entirely rather than mutating state that
+    /// may be half-updated; the next sweep picks it up.
     pub fn cleanup_expired(&self) {
-        {
-            let mut map = self.sessions.write().unwrap();
+        if let Ok(mut map) = write_lock!(self.sessions) {
             map.retain(|_, session_arc| {
-                let info = session_arc.lock().unwrap();
+                let Ok(info) = lock!(session_arc) else {
+                    // Keep it: dropping a live session over a lock we cannot trust is
+                    // a worse outcome than sweeping one round late.
+                    return true;
+                };
                 !info.is_expired()
             });
         }
-        {
-            let mut buffers = self.buffers.lock().unwrap();
+        if let Ok(mut buffers) = lock!(self.buffers) {
             buffers.retain(|_, buf| buf.created.elapsed() < SESSION_TIMEOUT);
         }
     }
 
     /// Get snapshot of all active sessions for stats.
+    ///
+    /// A poisoned lock yields an empty snapshot rather than panicking the stats call.
     pub fn get_all_sessions(&self) -> Vec<(PublicKey, u64, u64, Instant)> {
-        let map = self.sessions.read().unwrap();
+        let Ok(map) = read_lock!(self.sessions) else {
+            return Vec::new();
+        };
         let mut result = Vec::with_capacity(map.len());
         for (key, session_arc) in map.iter() {
-            let info = session_arc.lock().unwrap();
+            let Ok(info) = lock!(session_arc) else {
+                continue;
+            };
             result.push((*key, info.tx, info.rx, info.since));
         }
         result
@@ -1180,5 +1226,32 @@ mod tests {
             }
         }
         panic!("expected msg2 delivery");
+    }
+
+    /// A poisoned lock must not panic. Poison is sticky, so whatever the poisoned
+    /// path does is the steady state afterwards, not a one-off: the hot path treats
+    /// the peer as unknown and starts a fresh handshake, the sweep skips the round,
+    /// and stats report an empty snapshot.
+    #[test]
+    fn poisoned_lock_does_not_panic() {
+        let mgr = ConcurrentSessionManager::new(GroupAuth::default());
+        let (signing_key, pub_key, _) = make_keys();
+
+        // Poison the session map by panicking while holding its write lock.
+        {
+            let _guard = mgr.sessions.write().unwrap();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                panic!("poison the lock")
+            }));
+        }
+
+        // Treated as an unknown peer: a fresh Init, not a dropped packet.
+        assert!(matches!(
+            mgr.handle_traffic(&pub_key, b"hello", &signing_key).as_slice(),
+            [OutAction::SendToInner { .. }]
+        ));
+        // Sweep skipped; stats report an empty snapshot.
+        mgr.cleanup_expired();
+        assert!(mgr.get_all_sessions().is_empty());
     }
 }
