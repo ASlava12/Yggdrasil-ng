@@ -361,6 +361,14 @@ fn age_of(t: &Option<std::time::Instant>) -> String {
     }
 }
 
+/// Preserve the actual deadline after poison; `None` means an expired timer.
+fn read_deadline_remaining(read_deadline: &ReadDeadline, peer_timeout: Duration) -> Option<Duration> {
+    match *lock_recover!(read_deadline) {
+        Some(d) => d.checked_duration_since(std::time::Instant::now()),
+        None => Some(peer_timeout),
+    }
+}
+
 /// The peer reader task. Reads frames from the connection and dispatches
 /// messages to the router via the shared mutex.
 /// Returns Ok(()) for clean shutdown, Err with disconnect reason otherwise.
@@ -417,15 +425,7 @@ pub(crate) async fn peer_reader(
                 // Time left on the outstanding deadline. `None` means it just
                 // expired; no deadline at all means idle, so wait a full
                 // interval before looking again.
-                let remaining = match lock!(read_deadline) {
-                    Ok(deadline) => match *deadline {
-                        Some(d) => d.checked_duration_since(std::time::Instant::now()),
-                        None => Some(peer_timeout),
-                    },
-                    // Cannot trust the deadline; treat it as unset and wait a full
-                    // interval rather than tear the link down on a bad reading.
-                    Err(_) => None,
-                };
+                let remaining = read_deadline_remaining(&read_deadline, peer_timeout);
 
                 let wait = match remaining {
                     Some(remaining) => remaining,
@@ -1145,4 +1145,26 @@ pub(crate) async fn dispatch_actions(
 
     // Send traffic in one lock acquisition.
     send_traffic_to_peers_batch(peers, traffic_batch).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poisoned_read_deadline_keeps_its_value() {
+        let deadline: ReadDeadline = Arc::new(std::sync::Mutex::new(Some(
+            std::time::Instant::now() + Duration::from_secs(3600),
+        )));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = deadline.lock().expect("unpoisoned before test");
+            panic!("poison the deadline");
+        }));
+        assert!(deadline.is_poisoned());
+
+        assert!(read_deadline_remaining(&deadline, Duration::from_secs(5))
+            .is_some_and(|remaining| remaining > Duration::from_secs(3500)));
+        *lock_recover!(deadline) = Some(std::time::Instant::now() - Duration::from_secs(1));
+        assert_eq!(read_deadline_remaining(&deadline, Duration::from_secs(5)), None);
+    }
 }

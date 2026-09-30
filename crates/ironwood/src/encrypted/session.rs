@@ -602,6 +602,30 @@ impl ConcurrentSessionManager {
         }
     }
 
+    /// The map contains independent session entries. After a writer panic, keep
+    /// intact entries and discard only sessions whose own mutex was poisoned.
+    fn sessions_for_write(
+        &self,
+    ) -> std::sync::RwLockWriteGuard<'_, HashMap<PublicKey, Arc<std::sync::Mutex<SessionInfo>>>> {
+        let mut map = write_lock_recover!(self.sessions);
+        if self.sessions.is_poisoned() {
+            map.retain(|_, session| !session.is_poisoned());
+            self.sessions.clear_poison();
+            tracing::warn!("recovered poisoned session map; intact sessions retained");
+        }
+        map
+    }
+
+    fn session_for(&self, peer: &PublicKey) -> Option<Arc<std::sync::Mutex<SessionInfo>>> {
+        match read_lock!(self.sessions) {
+            Ok(map) => map.get(peer).cloned(),
+            Err(_) => {
+                drop(self.sessions_for_write());
+                read_lock!(self.sessions).ok()?.get(peer).cloned()
+            }
+        }
+    }
+
     /// Dispatch incoming data by message type (no locking at this level).
     pub fn handle_data(
         &self,
@@ -638,13 +662,7 @@ impl ConcurrentSessionManager {
     /// Handle incoming traffic (hot path).
     /// Uses 3-phase pattern: snapshot under lock → decrypt outside lock → finalize under lock.
     fn handle_traffic(&self, from: &PublicKey, data: &[u8], our_ed_priv: &ed25519_dalek::SigningKey) -> Vec<OutAction> {
-        let session_arc = match read_lock!(self.sessions) {
-            Ok(map) => map.get(from).cloned(),
-            // Cannot read the table, so treat the peer as unknown: the branch below
-            // starts a fresh handshake, which is self-healing rather than a dropped
-            // packet.
-            Err(_) => None,
-        };
+        let session_arc = self.session_for(from);
 
         let Some(session_arc) = session_arc else {
             tracing::debug!("encrypted: no session for {:?}, sending throwaway Init", hex::encode(&from[..4]));
@@ -716,10 +734,7 @@ impl ConcurrentSessionManager {
         msg: &[u8],
         our_ed_priv: &ed25519_dalek::SigningKey,
     ) -> Vec<OutAction> {
-        let session_arc = match read_lock!(self.sessions) {
-            Ok(map) => map.get(dest).cloned(),
-            Err(_) => None,
-        };
+        let session_arc = self.session_for(dest);
 
         if let Some(session_arc) = session_arc {
             // Phase 1: snapshot under lock. Guard scoped to this block — phase 3
@@ -765,10 +780,7 @@ impl ConcurrentSessionManager {
         let mut actions = Vec::new();
 
         // Try read-lock first: existing session?
-        let existing = match read_lock!(self.sessions) {
-            Ok(map) => map.get(from).cloned(),
-            Err(_) => None,
-        };
+        let existing = self.session_for(from);
 
         if let Some(session_arc) = existing {
             // Existing session: update under per-session lock
@@ -787,9 +799,7 @@ impl ConcurrentSessionManager {
             }
         } else {
             // New session: need write lock on map
-            let Ok(mut map) = write_lock!(self.sessions) else {
-                return actions;
-            };
+            let mut map = self.sessions_for_write();
 
             // Double-check: another thread may have inserted between read and write
             if let Some(session_arc) = map.get(from).cloned() {
@@ -844,10 +854,7 @@ impl ConcurrentSessionManager {
         let mut actions = Vec::new();
 
         // Try read-lock first: existing session?
-        let existing = match read_lock!(self.sessions) {
-            Ok(map) => map.get(from).cloned(),
-            Err(_) => None,
-        };
+        let existing = self.session_for(from);
 
         if let Some(session_arc) = existing {
             // Existing session: pure ack — just update keys, no reply needed.
@@ -859,9 +866,7 @@ impl ConcurrentSessionManager {
             }
         } else {
             // New session from ack: need write lock
-            let Ok(mut map) = write_lock!(self.sessions) else {
-                return actions;
-            };
+            let mut map = self.sessions_for_write();
 
             // Double-check
             if let Some(session_arc) = map.get(from).cloned() {
@@ -978,15 +983,14 @@ impl ConcurrentSessionManager {
 
     /// Clean up expired sessions and buffers.
     ///
-    /// A poisoned lock skips that sweep entirely rather than mutating state that
-    /// may be half-updated; the next sweep picks it up.
+    /// A poisoned session map is recovered before sweeping, and poisoned
+    /// individual sessions are evicted so they can be renegotiated.
     pub fn cleanup_expired(&self) {
-        if let Ok(mut map) = write_lock!(self.sessions) {
+        {
+            let mut map = self.sessions_for_write();
             map.retain(|_, session_arc| {
                 let Ok(info) = lock!(session_arc) else {
-                    // Keep it: dropping a live session over a lock we cannot trust is
-                    // a worse outcome than sweeping one round late.
-                    return true;
+                    return false;
                 };
                 !info.is_expired()
             });
@@ -1001,6 +1005,7 @@ impl ConcurrentSessionManager {
     /// A poisoned lock yields an empty snapshot rather than panicking the stats call.
     pub fn get_all_sessions(&self) -> Vec<(PublicKey, u64, u64, Instant)> {
         let Ok(map) = read_lock!(self.sessions) else {
+            drop(self.sessions_for_write());
             return Vec::new();
         };
         let mut result = Vec::with_capacity(map.len());
@@ -1228,30 +1233,80 @@ mod tests {
         panic!("expected msg2 delivery");
     }
 
-    /// A poisoned lock must not panic. Poison is sticky, so whatever the poisoned
-    /// path does is the steady state afterwards, not a one-off: the hot path treats
-    /// the peer as unknown and starts a fresh handshake, the sweep skips the round,
-    /// and stats report an empty snapshot.
+    /// A poisoned session map preserves intact entries and accepts new
+    /// handshakes without restarting the node.
     #[test]
-    fn poisoned_lock_does_not_panic() {
+    fn poisoned_session_map_recovers_and_renegotiates() {
         let mgr = ConcurrentSessionManager::new(GroupAuth::default());
-        let (signing_key, pub_key, _) = make_keys();
+        let remote = ConcurrentSessionManager::new(GroupAuth::default());
+        let (signing_key, pub_key, curve_priv) = make_keys();
+        let (remote_signing_key, remote_pub_key, remote_curve_priv) = make_keys();
 
         // Poison the session map by panicking while holding its write lock.
-        {
-            let _guard = mgr.sessions.write().unwrap();
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                panic!("poison the lock")
-            }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut guard = mgr.sessions.write().expect("unpoisoned before test");
+            // Leave an intact entry behind: recovery must retain it.
+            guard.insert(pub_key, Arc::new(std::sync::Mutex::new(SessionInfo::new([1; 32], [2; 32], 0))));
+            panic!("poison the lock");
+        }));
+        assert!(mgr.sessions.is_poisoned());
+
+        let init = mgr.write_to(&remote_pub_key, b"hello", &signing_key);
+        assert!(!mgr.sessions.is_poisoned());
+        assert!(mgr.sessions.read().expect("recovered map").contains_key(&pub_key));
+        let OutAction::SendToInner { data: init_data, .. } = &init[0] else {
+            panic!("expected Init");
+        };
+        let ack = remote.handle_data(&pub_key, init_data, &remote_curve_priv, &remote_signing_key);
+        let OutAction::SendToInner { data: ack_data, .. } = &ack[0] else {
+            panic!("expected Ack");
+        };
+        let followup = mgr.handle_data(&remote_pub_key, ack_data, &curve_priv, &signing_key);
+        assert!(followup.iter().any(|action| {
+            let OutAction::SendToInner { data, .. } = action else { return false };
+            remote.handle_data(&pub_key, data, &remote_curve_priv, &remote_signing_key)
+                .iter()
+                .any(|reply| matches!(reply, OutAction::Deliver { data, .. } if data == b"hello"))
+        }));
+
+        mgr.cleanup_expired();
+        assert_eq!(mgr.get_all_sessions().len(), 2);
+    }
+
+    #[test]
+    fn poisoned_session_map_preserves_existing_session() {
+        let local = ConcurrentSessionManager::new(GroupAuth::default());
+        let remote = ConcurrentSessionManager::new(GroupAuth::default());
+        let (local_signing_key, local_pub_key, local_curve_priv) = make_keys();
+        let (remote_signing_key, remote_pub_key, remote_curve_priv) = make_keys();
+
+        let init = local.write_to(&remote_pub_key, b"before", &local_signing_key);
+        let OutAction::SendToInner { data: init_data, .. } = &init[0] else {
+            panic!("expected Init");
+        };
+        let ack = remote.handle_data(&local_pub_key, init_data, &remote_curve_priv, &remote_signing_key);
+        let OutAction::SendToInner { data: ack_data, .. } = &ack[0] else {
+            panic!("expected Ack");
+        };
+        for action in local.handle_data(&remote_pub_key, ack_data, &local_curve_priv, &local_signing_key) {
+            if let OutAction::SendToInner { data, .. } = action {
+                remote.handle_data(&local_pub_key, &data, &remote_curve_priv, &remote_signing_key);
+            }
         }
 
-        // Treated as an unknown peer: a fresh Init, not a dropped packet.
-        assert!(matches!(
-            mgr.handle_traffic(&pub_key, b"hello", &signing_key).as_slice(),
-            [OutAction::SendToInner { .. }]
-        ));
-        // Sweep skipped; stats report an empty snapshot.
-        mgr.cleanup_expired();
-        assert!(mgr.get_all_sessions().is_empty());
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = local.sessions.write().expect("unpoisoned before test");
+            panic!("poison the map");
+        }));
+        assert!(local.sessions.is_poisoned());
+
+        let sent = local.write_to(&remote_pub_key, b"after", &local_signing_key);
+        assert!(!local.sessions.is_poisoned());
+        let OutAction::SendToInner { data, .. } = &sent[0] else {
+            panic!("expected traffic");
+        };
+        assert!(remote.handle_data(&local_pub_key, data, &remote_curve_priv, &remote_signing_key)
+            .iter()
+            .any(|action| matches!(action, OutAction::Deliver { data, .. } if data == b"after")));
     }
 }
